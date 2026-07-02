@@ -14,6 +14,7 @@ import type {
 	SingleResult,
 } from "@oh-my-pi/pi-coding-agent";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent";
+import { matchSteeringProfiles } from "../steering";
 import type { SwarmAgent } from "./schema";
 import type { StateTracker } from "./state";
 
@@ -22,6 +23,8 @@ export interface SwarmExecutorOptions {
 	swarmName: string;
 	iteration: number;
 	modelOverride?: string;
+	/** Swarm-level per-model steering profiles (selector substring → text). */
+	steeringProfiles?: Record<string, string>;
 	signal?: AbortSignal;
 	onProgress?: (agentName: string, progress: AgentProgress) => void;
 	modelRegistry?: ModelRegistry;
@@ -43,15 +46,25 @@ export async function executeSwarmAgent(
 	index: number,
 	options: SwarmExecutorOptions,
 ): Promise<SingleResult> {
-	const { workspace, swarmName, iteration, modelOverride, signal, onProgress, modelRegistry, settings, stateTracker } =
-		options;
+	const {
+		workspace,
+		swarmName,
+		iteration,
+		modelOverride,
+		steeringProfiles,
+		signal,
+		onProgress,
+		modelRegistry,
+		settings,
+		stateTracker,
+	} = options;
 
 	const agentId = `swarm-${swarmName}-${agent.name}-${iteration}`;
 
 	const agentDef: AgentDefinition = {
 		name: agent.name,
 		description: `Swarm agent: ${agent.role}`,
-		systemPrompt: buildSystemPrompt(agent),
+		systemPrompt: buildSystemPrompt(agent, resolveSteering(agent, modelOverride, steeringProfiles)),
 		source: "project" as AgentSource,
 	};
 
@@ -102,10 +115,27 @@ export async function executeSwarmAgent(
 	}
 }
 
-function buildSystemPrompt(agent: SwarmAgent): string {
+function buildSystemPrompt(agent: SwarmAgent, steering: string[]): string {
 	const parts = [`You are a ${agent.role}.`];
 	if (agent.extraContext) {
 		parts.push(agent.extraContext);
 	}
+	parts.push(...steering);
 	return parts.join("\n\n");
+}
+
+/**
+ * Resolve the steering text for an agent: every swarm-level profile whose
+ * selector is a case-insensitive substring of the resolved model selector
+ * (`"*"` matches every agent) plus the agent's own `steering` field last.
+ * Multiple matches concatenate in profile-declaration order.
+ */
+export function resolveSteering(
+	agent: SwarmAgent,
+	modelOverride: string | undefined,
+	profiles: Record<string, string> | undefined,
+): string[] {
+	const parts = matchSteeringProfiles(modelOverride, profiles);
+	if (agent.steering) parts.push(agent.steering);
+	return parts;
 }

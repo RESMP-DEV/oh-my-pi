@@ -21,7 +21,8 @@
     "extension"
   ],
   "bin": {
-    "omp-swarm": "src/cli.ts"
+    "omp-swarm": "src/cli.ts",
+    "omp-queue": "src/queue-cli.ts"
   },
   "scripts": {
     "check": "biome check . && bun run check:types",
