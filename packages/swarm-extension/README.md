@@ -2,7 +2,7 @@
 
 Multi-agent orchestration for oh-my-pi. Define agent workflows in YAML — pipelines, parallel fan-outs, sequential chains, or any DAG — and run them unattended until completion.
 
-Each agent is a full oh-my-pi subagent with access to every tool: bash, python, read, write, edit, grep, find, fetch, web_search, browser. The orchestrator manages lifecycle and ordering; agents communicate through the shared workspace filesystem.
+Each agent is a full oh-my-pi subagent with access to every tool: bash, eval (Python/JS kernels), read, write, edit, grep, glob, fetch, web_search, browser. The orchestrator manages lifecycle and ordering; agents communicate through the shared workspace filesystem.
 
 Use it for anything: research pipelines, code generation, data processing, content creation, analysis workflows, CI-like automation — any multi-step task that benefits from specialized agents working in coordination.
 
@@ -20,13 +20,14 @@ bun install
 ```bash
 # Foreground — runs until complete, no timeout:
 omp-swarm path/to/swarm.yaml
+omp-queue path/to/tasks.yaml
 
 # Background — survives terminal close:
 nohup omp-swarm path/to/swarm.yaml \
   > pipeline.log 2>&1 & disown
 ```
 
-The standalone runner has no timeout. It runs iteration after iteration until the pipeline finishes or you kill it.
+The standalone runners have no timeout. They run until the pipeline/queue finishes or you kill them.
 
 ### Inside oh-my-pi (TUI)
 
@@ -43,7 +44,8 @@ Then:
 ```
 /swarm run path/to/swarm.yaml
 /swarm status <name>
-/swarm help
+/queue run path/to/tasks.yaml
+/queue status <name>
 ```
 
 ## Monitoring
@@ -61,8 +63,8 @@ State persists to `<workspace>/.swarm_<name>/` while the pipeline runs:
 Check on a running pipeline:
 
 ```bash
-# Quick status
-cat workspace/.swarm_mypipeline/state/pipeline.json | python -m json.tool
+# Quick status (state file is pretty-printed JSON)
+cat workspace/.swarm_mypipeline/state/pipeline.json
 
 # Watch the orchestrator log
 tail -f workspace/.swarm_mypipeline/logs/orchestrator.log
@@ -105,6 +107,8 @@ swarm:
 | `mode`         | no       | `sequential`    | Execution mode (see below)                                                     |
 | `target_count` | no       | `1`             | How many times to repeat the full pipeline. Only meaningful in `pipeline` mode |
 | `model`        | no       | session default | Default model for agents that do not set `agents.<name>.model`                |
+| `max_parallel` | no       | `0` (unbounded) | Max agents running concurrently within a wave                                  |
+| `steering`     | no       | —               | Per-model steering profiles (see [Steering Profiles](#steering-profiles))      |
 
 ### Agent Fields
 
@@ -114,6 +118,7 @@ swarm:
 | `task`          | yes      | Complete instructions sent as user prompt. Use YAML `\|` for multi-line |
 | `extra_context` | no       | Additional text appended to system prompt                               |
 | `model`         | no       | Model override for this agent only                                      |
+| `steering`      | no       | Extra system-prompt discipline for this agent, appended verbatim        |
 | `reports_to`    | no       | List of agent names that depend on this agent                           |
 | `waits_for`     | no       | List of agent names this agent depends on                               |
 
@@ -386,9 +391,9 @@ Execution per iteration: scraper_a + scraper_b (wave 1) -> transformer (wave 2) 
 
 Each agent is a full oh-my-pi session. It can:
 
-- **bash/python**: Run commands, scripts, install packages, process data
+- **bash/eval**: Run commands and Python/JS code, install packages, process data
 - **read/write/edit**: Create and modify files in the workspace
-- **grep/find**: Search the workspace (or anywhere on disk)
+- **grep/glob**: Search the workspace (or anywhere on disk)
 - **web_search**: Search the internet (via configured provider)
 - **fetch**: Download web pages, APIs, documents
 - **browser**: Navigate websites, scrape dynamic content, take screenshots
@@ -453,20 +458,108 @@ swarm:
         Review the draft.
 ```
 
-Precedence: `agents.<name>.model` → `swarm.model` → session default. Check `packages/ai/src/models.json` for available model IDs.
+Precedence: `agents.<name>.model` → `swarm.model` → session default. Check `packages/catalog/src/models.json` for available model IDs.
+
+### Steering Profiles
+
+Cheap models need discipline, not distrust. `swarm.steering` maps a **selector** to system-prompt text appended to every agent whose resolved model selector contains that substring (case-insensitive). `"*"` matches every agent. Multiple matches concatenate in declaration order; an agent's own `steering` field lands last.
+
+```yaml
+swarm:
+  model: claude-haiku-4-5
+  steering:
+    "*": |
+      After every file change, run the check command and paste its output.
+    haiku: |
+      One file at a time. If a step fails twice, write BLOCKED:<reason>
+      to signals/ and stop — do not improvise.
+    glm: |
+      Keep diffs minimal. Never refactor beyond the task.
+  agents:
+    fixer:
+      role: bug-fixer
+      model: glm-4.6                  # gets "*" + glm
+      task: |
+        Fix the failing test in tests/test_router.py.
+    reviewer:
+      role: reviewer
+      model: claude-opus-4-6          # gets "*" only
+      steering: "Approve only when the invariant table is complete."
+      task: |
+        Review the fix.
+```
+
+---
+
+## Task Queues
+
+Swarm pipelines run a **static DAG in waves** — every agent in wave N must finish before wave N+1 starts. Task queues are the complement for bulk work: **N workers pull from a dependency-gated, priority-ordered queue**, each task unblocks the moment its dependencies complete, and failures retry up a **model escalation ladder** with an objective `verify` gate.
+
+Use a swarm when the shape of the work is the point (fan-out/fan-in, staged handoffs). Use a queue when you have a pile of tasks and want maximum throughput at minimum cost.
+
+```yaml
+tasks:
+  name: refactor-sweep
+  workspace: ./ws
+  workers: 8                      # concurrent workers
+  escalation:                     # attempt N uses rung min(N, last)
+    - claude-haiku-4-5            # cheap first
+    - claude-sonnet-4-5
+    - claude-opus-4-6             # frontier last
+  steering:
+    "*": "Run the verify command yourself before finishing."
+  max_retries: 3                  # retries after the first attempt
+  verify_timeout_seconds: 600
+  items:
+    - id: contract
+      prompt: Define the shared API contract in src/contract.ts
+      priority: 0                 # lower runs sooner among ready tasks
+      verify: bun check           # exit 0 = accepted (rejection sampling)
+    - id: impl_a
+      prompt: Implement module A against the contract
+      depends_on: [contract]
+      verify: bun test src/a.test.ts
+    - id: impl_b
+      prompt: Implement module B against the contract
+      depends_on: [contract]
+      model: glm-4.6                     # pinned — never escalates
+      verify: bun test src/b.test.ts
+    - id: integrate
+      prompt: Wire A and B together
+      depends_on: [impl_a, impl_b]
+      verify: bun test
+```
+
+Semantics:
+
+- **Scheduling** — a task is *ready* when every `depends_on` entry completed. Among ready tasks, lowest `priority` wins (declaration order breaks ties). Workers never idle behind an unrelated slow task.
+- **Verification** — after the agent exits 0, `verify` runs in the workspace via `bash -c`. Non-zero exit rejects the attempt regardless of what the model claimed.
+- **Escalation** — attempt N uses `escalation[min(N, len-1)]`. A failed cheap attempt escalates one rung; the frontier model is the last resort, not the default. Tasks that pin `model` retry on the same model instead. Omit `escalation` entirely and every attempt uses the task `model` or the session default.
+- **Skip cascade** — when a task exhausts its retries (or is skipped), every transitive dependent is marked `skipped`, never run.
+- **State** — persists to `<workspace>/.queue_<name>/` (`state/queue.json`, `logs/orchestrator.log`, `logs/<task>.log`, `context/`), same layout as swarms.
+
+Queue `steering` uses the same selector semantics as swarms, matched against the model actually chosen for each attempt — so discipline text follows the task down the ladder and drops away on strong models.
 
 ---
 
 ## Architecture
 
 ```
-src/extension.ts      TUI entry point (registers /swarm command)
-src/cli.ts   Standalone runner (no TUI, no timeout)
+src/extension.ts      TUI entry point (registers /swarm and /queue commands)
+src/cli.ts            Standalone swarm runner (no TUI, no timeout)
+src/queue-cli.ts      Standalone queue runner (no TUI, no timeout)
+src/steering.ts       Per-model steering profile matching (shared)
 src/swarm/
   schema.ts           YAML parsing + validation
   dag.ts              Dependency graph, cycle detection, topological sort
   executor.ts         Spawns agents via oh-my-pi's runSubprocess
   pipeline.ts         Iteration loop + wave controller
   state.ts            Filesystem state persistence
+  render.ts           Progress display formatting
+src/queue/
+  schema.ts           Task-queue YAML parsing + dependency validation
+  runner.ts           Worker pool, ready-task scheduling, escalation ladder
+  executor.ts         One attempt: subagent run + verify command
+  state.ts            Filesystem state persistence (.queue_<name>/)
   render.ts           Progress display formatting
 ```

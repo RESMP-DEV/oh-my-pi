@@ -4,15 +4,21 @@
  * Registers:
  * - /swarm run <file.yaml>   — Execute a swarm pipeline
  * - /swarm status             — Show current pipeline status
+ * - /queue run <file.yaml>   — Execute a task queue (workers + escalation)
+ * - /queue status             — Show current queue status
  *
  * Usage: Add this extension's directory to your extensions config,
- * then use /swarm in any oh-my-pi session.
+ * then use /swarm or /queue in any oh-my-pi session.
  */
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { formatDuration } from "@oh-my-pi/pi-utils";
+import { renderQueueProgress } from "./queue/render";
+import { QueueRunner } from "./queue/runner";
+import { parseTaskQueueYaml, type TaskQueueDefinition } from "./queue/schema";
+import { QueueStateTracker } from "./queue/state";
 import { buildDependencyGraph, buildExecutionWaves, detectCycles } from "./swarm/dag";
 import { PipelineController } from "./swarm/pipeline";
 import { renderSwarmProgress } from "./swarm/render";
@@ -55,6 +61,47 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 							"  /swarm run <file.yaml>     Run a pipeline",
 							"  /swarm status [name]       Show pipeline status",
 							"  /swarm help                Show this help",
+						].join("\n"),
+						"info",
+					);
+					return;
+			}
+		},
+	});
+
+	pi.registerCommand("queue", {
+		description: "Run a dependency-gated task queue with model escalation from YAML",
+		getArgumentCompletions: prefix => {
+			const subcommands = ["run", "status", "help"];
+			if (!prefix) return subcommands.map(s => ({ label: s, value: s }));
+			return subcommands.filter(s => s.startsWith(prefix)).map(s => ({ label: s, value: s }));
+		},
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const parts = args.trim().split(/\s+/);
+			const subcommand = parts[0] ?? "help";
+
+			switch (subcommand) {
+				case "run": {
+					const yamlPath = parts[1];
+					if (!yamlPath) {
+						ctx.ui.notify("Usage: /queue run <path/to/tasks.yaml>", "error");
+						return;
+					}
+					await handleQueueRun(yamlPath, ctx, pi);
+					return;
+				}
+				case "status": {
+					await handleQueueStatus(parts[1], ctx);
+					return;
+				}
+				default:
+					ctx.ui.notify(
+						[
+							"Queue — dependency-gated task queue with model escalation",
+							"",
+							"  /queue run <file.yaml>     Run a task queue",
+							"  /queue status [name]       Show queue status",
+							"  /queue help                Show this help",
 						].join("\n"),
 						"info",
 					);
@@ -241,6 +288,162 @@ function buildSummaryMessage(
 		const duration =
 			agent.startedAt && agent.completedAt ? formatDuration(agent.completedAt - agent.startedAt) : "n/a";
 		lines.push(`- **${name}**: ${agent.status} (${duration})${agent.error ? ` — ${agent.error}` : ""}`);
+	}
+
+	if (result.errors.length > 0) {
+		lines.push("");
+		lines.push("### Errors");
+		lines.push("");
+		for (const error of result.errors) {
+			lines.push(`- ${error}`);
+		}
+	}
+
+	return lines.join("\n");
+}
+
+// ============================================================================
+// /queue run
+// ============================================================================
+
+async function handleQueueRun(yamlPath: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+	const resolvedPath = path.isAbsolute(yamlPath) ? yamlPath : path.resolve(ctx.cwd, yamlPath);
+
+	let content: string;
+	try {
+		content = await Bun.file(resolvedPath).text();
+	} catch {
+		ctx.ui.notify(`Cannot read file: ${resolvedPath}`, "error");
+		return;
+	}
+
+	let def: TaskQueueDefinition;
+	try {
+		def = parseTaskQueueYaml(content);
+	} catch (err) {
+		ctx.ui.notify(`YAML error: ${err instanceof Error ? err.message : String(err)}`, "error");
+		return;
+	}
+
+	// Resolve workspace (relative to YAML file location)
+	const workspace = path.isAbsolute(def.workspace)
+		? def.workspace
+		: path.resolve(path.dirname(resolvedPath), def.workspace);
+	await fs.mkdir(workspace, { recursive: true });
+
+	const stateTracker = new QueueStateTracker(workspace, def.name);
+	await stateTracker.init(
+		def.tasks.map(t => t.id),
+		def.workers,
+	);
+
+	pi.logger.debug("Queue starting", {
+		name: def.name,
+		workers: def.workers,
+		tasks: def.tasks.map(t => t.id).join(", "),
+		escalation: def.escalation.join(" -> "),
+		workspace,
+	});
+	ctx.ui.notify(`Starting queue '${def.name}': ${def.tasks.length} tasks, ${def.workers} workers`, "info");
+
+	const widgetKey = `queue-${def.name}`;
+	const updateWidget = () => {
+		ctx.ui.setWidget(widgetKey, renderQueueProgress(stateTracker.state));
+	};
+	updateWidget();
+
+	const runner = new QueueRunner(def, stateTracker);
+	const result = await runner.run({
+		workspace,
+		onProgress: () => updateWidget(),
+		modelRegistry: ctx.modelRegistry,
+		settings: pi.pi.settings,
+	});
+
+	ctx.ui.setWidget(widgetKey, undefined);
+
+	const elapsed = stateTracker.state.completedAt
+		? formatDuration(stateTracker.state.completedAt - stateTracker.state.startedAt)
+		: "unknown";
+	const summaryParts = [
+		`Queue '${def.name}' ${result.status}`,
+		`${result.completed}/${def.tasks.length} completed`,
+		`elapsed: ${elapsed}`,
+	];
+	if (result.failed > 0) summaryParts.push(`${result.failed} failed`);
+	if (result.skipped > 0) summaryParts.push(`${result.skipped} skipped`);
+
+	ctx.ui.notify(summaryParts.join(" | "), result.status === "completed" ? "info" : "error");
+	if (result.errors.length > 0) {
+		pi.logger.warn("Queue completed with errors", { errors: result.errors });
+	}
+
+	// Send summary to the conversation so the LLM knows what happened
+	pi.sendMessage(
+		{
+			customType: "queue-result",
+			content: [{ type: "text", text: buildQueueSummaryMessage(def, result, stateTracker, workspace) }],
+			display: true,
+			details: {
+				queueName: def.name,
+				status: result.status,
+				completed: result.completed,
+				failed: result.failed,
+				skipped: result.skipped,
+				errorCount: result.errors.length,
+			},
+		},
+		{ triggerTurn: false },
+	);
+}
+
+// ============================================================================
+// /queue status
+// ============================================================================
+
+async function handleQueueStatus(name: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
+	if (!name) {
+		ctx.ui.notify("Usage: /queue status <name>  (reads .queue_<name>/state/queue.json from cwd)", "info");
+		return;
+	}
+
+	const stateTracker = new QueueStateTracker(ctx.cwd, name);
+	const state = await stateTracker.load();
+	if (!state) {
+		ctx.ui.notify(`No state found for queue '${name}' in ${ctx.cwd}`, "error");
+		return;
+	}
+
+	ctx.ui.notify(renderQueueProgress(state).join("\n"), "info");
+}
+
+function buildQueueSummaryMessage(
+	def: TaskQueueDefinition,
+	result: { status: string; completed: number; failed: number; skipped: number; errors: string[] },
+	stateTracker: QueueStateTracker,
+	workspace: string,
+): string {
+	const lines: string[] = [];
+	lines.push(`## Task Queue: ${def.name}`);
+	lines.push("");
+	lines.push(`- **Status**: ${result.status}`);
+	lines.push(`- **Completed**: ${result.completed}/${def.tasks.length}`);
+	if (result.failed > 0) lines.push(`- **Failed**: ${result.failed}`);
+	if (result.skipped > 0) lines.push(`- **Skipped**: ${result.skipped}`);
+	lines.push(`- **Workspace**: ${workspace}`);
+	lines.push(`- **State dir**: ${stateTracker.queueDir}`);
+	lines.push("");
+
+	lines.push("### Task Results");
+	lines.push("");
+	for (const [id, task] of Object.entries(stateTracker.state.tasks)) {
+		const duration = task.startedAt && task.completedAt ? formatDuration(task.completedAt - task.startedAt) : "n/a";
+		const attempts = task.attempts.length;
+		const model = task.attempts.at(-1)?.model;
+		const detail = [`${attempts} attempt${attempts === 1 ? "" : "s"}`, model && `last on ${model}`]
+			.filter(Boolean)
+			.join(", ");
+		lines.push(`- **${id}**: ${task.status} (${duration}; ${detail})${task.error ? ` — ${task.error}` : ""}`);
 	}
 
 	if (result.errors.length > 0) {

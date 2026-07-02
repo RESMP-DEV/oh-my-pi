@@ -151,47 +151,47 @@ export class PipelineController {
 			}
 			options.emitProgress(waveIdx);
 
-			// Execute all agents in wave in parallel, catching per-agent errors
-			const waveResults = await Promise.all(
-				wave.map(async agentName => {
-					const agent = this.#def.agents.get(agentName)!;
-					const currentIndex = agentIndex++;
-					try {
-						const result = await executeSwarmAgent(agent, currentIndex, {
-							workspace: options.workspace,
-							swarmName: this.#def.name,
-							iteration,
-							modelOverride: agent.model ?? this.#def.model,
-							signal: options.signal,
-							onProgress: (_name, _progress) => {
-								options.emitProgress(waveIdx);
-							},
-							modelRegistry: options.modelRegistry,
-							settings: options.settings,
-							stateTracker: this.#stateTracker,
-						});
-						return { agentName, result };
-					} catch (err) {
-						const error = err instanceof Error ? err.message : String(err);
-						const failResult: SingleResult = {
-							index: currentIndex,
-							id: `swarm-${this.#def.name}-${agentName}-${iteration}`,
-							agent: agentName,
-							agentSource: "project" as AgentSource,
-							task: agent.task,
-							exitCode: 1,
-							output: "",
-							stderr: error,
-							truncated: false,
-							durationMs: 0,
-							tokens: 0,
-							requests: 0,
-							error,
-						};
-						return { agentName, result: failResult };
-					}
-				}),
-			);
+			// Execute all agents in wave in parallel (bounded by max_parallel),
+			// catching per-agent errors
+			const waveResults = await mapWithLimit(wave, this.#def.maxParallel, async agentName => {
+				const agent = this.#def.agents.get(agentName)!;
+				const currentIndex = agentIndex++;
+				try {
+					const result = await executeSwarmAgent(agent, currentIndex, {
+						workspace: options.workspace,
+						swarmName: this.#def.name,
+						iteration,
+						modelOverride: agent.model ?? this.#def.model,
+						steeringProfiles: this.#def.steering,
+						signal: options.signal,
+						onProgress: (_name, _progress) => {
+							options.emitProgress(waveIdx);
+						},
+						modelRegistry: options.modelRegistry,
+						settings: options.settings,
+						stateTracker: this.#stateTracker,
+					});
+					return { agentName, result };
+				} catch (err) {
+					const error = err instanceof Error ? err.message : String(err);
+					const failResult: SingleResult = {
+						index: currentIndex,
+						id: `swarm-${this.#def.name}-${agentName}-${iteration}`,
+						agent: agentName,
+						agentSource: "project" as AgentSource,
+						task: agent.task,
+						exitCode: 1,
+						output: "",
+						stderr: error,
+						truncated: false,
+						durationMs: 0,
+						tokens: 0,
+						requests: 0,
+						error,
+					};
+					return { agentName, result: failResult };
+				}
+			});
 
 			for (const { agentName, result } of waveResults) {
 				results.set(agentName, result);
@@ -210,4 +210,26 @@ export class PipelineController {
 		}
 		return snapshot;
 	}
+}
+
+/**
+ * Map items through `fn` with at most `limit` concurrent workers
+ * (0 = unbounded). Preserves input order in the result array. Rejections
+ * propagate — callers keep per-item try/catch inside `fn`.
+ */
+async function mapWithLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+	if (limit <= 0 || limit >= items.length) {
+		return Promise.all(items.map(fn));
+	}
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const workers = Array.from({ length: limit }, async () => {
+		while (next < items.length) {
+			const index = next++;
+			if (index >= items.length) return;
+			results[index] = await fn(items[index]);
+		}
+	});
+	await Promise.all(workers);
+	return results;
 }

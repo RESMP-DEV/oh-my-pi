@@ -9,6 +9,7 @@ interface RawSwarmAgentConfig {
 	reports_to?: string[];
 	waits_for?: string[];
 	model?: string;
+	steering?: string;
 }
 
 interface RawSwarmConfig {
@@ -17,6 +18,8 @@ interface RawSwarmConfig {
 	mode?: string;
 	target_count?: number;
 	model?: string;
+	max_parallel?: number;
+	steering?: Record<string, string>;
 	agents: Record<string, RawSwarmAgentConfig>;
 }
 
@@ -34,6 +37,8 @@ export interface SwarmAgent {
 	reportsTo: string[];
 	waitsFor: string[];
 	model?: string;
+	/** Extra system-prompt discipline for this agent, appended verbatim. */
+	steering?: string;
 }
 
 export interface SwarmDefinition {
@@ -42,6 +47,16 @@ export interface SwarmDefinition {
 	mode: SwarmMode;
 	targetCount: number;
 	model?: string;
+	/**
+	 * Per-model steering profiles: key is a case-insensitive substring matched
+	 * against the agent's resolved model selector (`"*"` matches every agent);
+	 * value is system-prompt text appended to matching agents. Lets weak/cheap
+	 * models (MiniMax, GLM, DeepSeek Flash) carry extra discipline while strong
+	 * models run clean.
+	 */
+	steering: Record<string, string>;
+	/** Max agents running concurrently within a wave. 0 = unbounded. */
+	maxParallel: number;
 	agents: Map<string, SwarmAgent>;
 	/** Preserves YAML declaration order for implicit pipeline sequencing. */
 	agentOrder: string[];
@@ -98,6 +113,7 @@ export function parseSwarmYaml(content: string): SwarmDefinition {
 			extraContext: config.extra_context?.trim(),
 			reportsTo: Array.isArray(config.reports_to) ? config.reports_to : [],
 			model: typeof config.model === "string" ? config.model.trim() : undefined,
+			steering: typeof config.steering === "string" ? config.steering.trim() : undefined,
 			waitsFor: Array.isArray(config.waits_for) ? config.waits_for : [],
 		});
 	}
@@ -108,9 +124,32 @@ export function parseSwarmYaml(content: string): SwarmDefinition {
 		mode: mode as SwarmMode,
 		targetCount: swarm.target_count ?? 1,
 		model: typeof swarm.model === "string" ? swarm.model.trim() : undefined,
+		steering: parseSteeringProfiles(swarm.steering),
+		maxParallel: normalizeMaxParallel(swarm.max_parallel),
 		agents,
 		agentOrder,
 	};
+}
+
+function parseSteeringProfiles(raw: Record<string, string> | undefined): Record<string, string> {
+	if (!raw || typeof raw !== "object") return {};
+	const profiles: Record<string, string> = {};
+	for (const [selector, text] of Object.entries(raw)) {
+		if (typeof text !== "string") {
+			throw new Error(`swarm.steering['${selector}'] must be a string`);
+		}
+		const trimmed = text.trim();
+		if (trimmed.length > 0) profiles[selector] = trimmed;
+	}
+	return profiles;
+}
+
+function normalizeMaxParallel(raw: number | undefined): number {
+	if (raw === undefined) return 0;
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+		throw new Error("swarm.max_parallel must be a non-negative integer");
+	}
+	return raw;
 }
 
 // ============================================================================
