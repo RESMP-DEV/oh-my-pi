@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { $flag } from "./env";
 
 // "reset after 1h2m3s" / "10m15s" / "39s"
 const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i;
@@ -143,6 +144,14 @@ export interface FetchWithRetryOptions extends RequestInit {
 	 * number sets a custom ceiling in ms. Bare browser/Node fetch ignores it.
 	 */
 	timeout?: number | false;
+	/**
+	 * Bun extension forwarded verbatim to the underlying `fetch` call:
+	 * curl-style transport logging on stderr (connect, TLS, headers, socket
+	 * close). Defaults to the `PI_FETCH_VERBOSE` env flag so socket-level
+	 * failures ("the socket connection was closed unexpectedly") can be
+	 * diagnosed without a code change. Bare browser/Node fetch ignores it.
+	 */
+	verbose?: boolean;
 }
 
 const DEFAULT_MAX_DELAY_MS = 60_000;
@@ -169,10 +178,17 @@ export async function fetchWithRetry(
 		shouldRetryResponse,
 		fetch: fetchImpl = fetch,
 		timeout = false,
+		verbose = $flag("PI_FETCH_VERBOSE"),
 		...baseInit
 	} = options;
 	const signal = baseInit.signal as AbortSignal | undefined;
 
+	// Once an attempt dies with a stale pooled-socket signature ("socket
+	// connection was closed unexpectedly", ECONNRESET/EPIPE), every further
+	// attempt sends `Connection: close`. Bun's fetch pool can hand retries the
+	// same half-open socket (oven-sh/bun#31894), so without this the whole
+	// retry budget can burn on one dead connection.
+	let bypassSocketPool = false;
 	for (let attempt = 0; ; attempt++) {
 		if (signal?.aborted) throw new Error("Request was aborted");
 		const requestUrl = typeof url === "function" ? url(attempt) : url;
@@ -183,11 +199,15 @@ export async function fetchWithRetry(
 		// silently dropped, so long-running streams were killed at ~300s (issue #602).
 		// Only forward when the caller actually set `timeout`, so callers that never
 		// set it keep Bun's default ceiling.
-		const init = prepareInit
-			? mergeInit(baseInit, await prepareInit(attempt), timeout)
-			: "timeout" in options
-				? ({ ...baseInit, timeout } as unknown as RequestInit)
+		const bunInit: Record<string, unknown> = {};
+		if ("timeout" in options) bunInit.timeout = timeout;
+		if (verbose) bunInit.verbose = true;
+		const mergedInit = prepareInit
+			? mergeInit(baseInit, await prepareInit(attempt), timeout, verbose)
+			: Object.keys(bunInit).length > 0
+				? ({ ...baseInit, ...bunInit } as unknown as RequestInit)
 				: baseInit;
+		const init = bypassSocketPool ? withConnectionClose(mergedInit) : mergedInit;
 
 		let response: Response;
 		try {
@@ -195,6 +215,7 @@ export async function fetchWithRetry(
 		} catch (error) {
 			if (signal?.aborted) throw new Error("Request was aborted");
 			const wrapped = wrapNetworkError(error);
+			if (isStalePooledSocketError(error, wrapped)) bypassSocketPool = true;
 			if (attempt + 1 >= maxAttempts) throw wrapped;
 			await scheduler.wait(resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), { signal });
 			continue;
@@ -214,8 +235,8 @@ export async function fetchWithRetry(
 	}
 }
 
-function mergeInit(base: RequestInit, overlay: RequestInit, timeout: number | false): RequestInit {
-	const merged = { ...base, ...overlay, timeout } as unknown as RequestInit;
+function mergeInit(base: RequestInit, overlay: RequestInit, timeout: number | false, verbose: boolean): RequestInit {
+	const merged = { ...base, ...overlay, timeout, ...(verbose ? { verbose } : {}) } as unknown as RequestInit;
 	if (base.headers || overlay.headers) {
 		const baseHeaders = new Headers(base.headers ?? undefined);
 		const overlayHeaders = new Headers(overlay.headers ?? undefined);
@@ -225,6 +246,28 @@ function mergeInit(base: RequestInit, overlay: RequestInit, timeout: number | fa
 		merged.headers = baseHeaders;
 	}
 	return merged;
+}
+
+/**
+ * Overlay `Connection: close` so the attempt opens a fresh TCP connection
+ * instead of drawing from the keep-alive pool.
+ */
+function withConnectionClose(init: RequestInit): RequestInit {
+	const headers = new Headers(init.headers ?? undefined);
+	headers.set("connection", "close");
+	return { ...init, headers };
+}
+
+/**
+ * Stale pooled-socket signature: Bun surfaces a reused half-open keep-alive
+ * socket as "The socket connection was closed unexpectedly" (or raw
+ * ECONNRESET/EPIPE codes). `wrapped` carries the `cause` message for
+ * "fetch failed" wrappers.
+ */
+function isStalePooledSocketError(original: unknown, wrapped: Error): boolean {
+	const code = (original as { code?: string } | null)?.code;
+	if (code === "ECONNRESET" || code === "EPIPE") return true;
+	return isUnexpectedSocketCloseMessage(wrapped.message);
 }
 
 function wrapNetworkError(error: unknown): Error {
